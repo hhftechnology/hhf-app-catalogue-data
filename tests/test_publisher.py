@@ -1,5 +1,7 @@
 import copy
 import unittest
+from unittest import mock
+from urllib.error import HTTPError
 from datetime import timedelta
 from pathlib import Path
 
@@ -8,6 +10,38 @@ from github_client import GitHub, GitHubError, development_signals
 from publisher import run
 from tests.fixture_source import BASELINE_INPUT, BUILD_TIME, ExampleGitHub, MemoryStore
 from upload_r2 import BASELINE, POINTER, StoreError, read_previous
+
+
+class _Response:
+    """Minimal stand-in for an http.client response."""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.headers = {}
+
+    def read(self, _limit=None):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+
+class _FlakyOpener:
+    """Raises the supplied HTTP status codes, then answers with a fixed payload."""
+
+    def __init__(self, failures, payload=b"{}"):
+        self.failures = list(failures)
+        self.payload = payload
+        self.calls = 0
+
+    def open(self, request, timeout=None):
+        self.calls += 1
+        if self.failures:
+            raise HTTPError(request.full_url, self.failures.pop(0), "upstream", {}, None)
+        return _Response(self.payload)
 
 
 class PublisherTest(unittest.TestCase):
@@ -192,6 +226,23 @@ class GitHubTest(unittest.TestCase):
         commits = [{"sha": "a" * 40, "commit": {"message": "Change behavior\n\nCo-authored-by: Copilot <example@users.noreply.github.com>"}}]
         signals = development_signals(repo, [], [], "This repository is largely AI-assisted", commits)
         self.assertEqual([(item["type"], item["weight"]) for item in signals], [("commit_trailer", 1.0), ("readme_declaration", 0.3)])
+
+    def test_transient_github_5xx_is_retried(self):
+        client = GitHub("token")
+        client.opener = _FlakyOpener([502, 503])
+        with mock.patch("github_client.time.sleep") as sleep:
+            self.assertEqual(client.request("/rate_limit"), {})
+        self.assertEqual(client.opener.calls, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_persistent_github_5xx_fails_with_checkpoint_message(self):
+        client = GitHub("token")
+        client.opener = _FlakyOpener([502] * 5)
+        with mock.patch("github_client.time.sleep"):
+            with self.assertRaises(GitHubError) as caught:
+                client.request("/rate_limit")
+        self.assertIn("resume from its checkpoint", str(caught.exception))
+        self.assertEqual(client.opener.calls, 5)
 
     def test_graphql_accepts_only_alias_level_not_found_and_public_repos(self):
         api = GitHub("unused")

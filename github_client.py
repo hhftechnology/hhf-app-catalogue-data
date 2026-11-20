@@ -1,7 +1,7 @@
 import json
 import re
 import time
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -94,16 +94,28 @@ class GitHub:
                     require(len(payload) <= 20_000_000, "oversized GitHub response")
                     return decode(payload)
             except HTTPError as error:
-                if error.code not in (403, 429):
+                # 5xx is GitHub answering under load, not a rejection: the request is a
+                # read, so a short bounded backoff keeps a 1,200-repository run alive
+                # instead of losing the whole snapshot to one upstream hiccup.
+                transient = error.code in (500, 502, 503, 504)
+                if not transient and error.code not in (403, 429):
                     raise GitHubError(f"GitHub API returned HTTP {error.code}") from None
-                retry_after = error.headers.get("Retry-After")
-                if error.headers.get("X-RateLimit-Remaining") == "0":
-                    reset = error.headers.get("X-RateLimit-Reset", "the next quota window")
-                    raise GitHubError(f"GitHub exhausted its quota; resume after {reset}") from None
-                wait = max(int(retry_after or 0), 60 * 2**attempt)
+                if transient:
+                    wait = 2**attempt
+                else:
+                    retry_after = error.headers.get("Retry-After")
+                    if error.headers.get("X-RateLimit-Remaining") == "0":
+                        reset = error.headers.get("X-RateLimit-Reset", "the next quota window")
+                        raise GitHubError(f"GitHub exhausted its quota; resume after {reset}") from None
+                    wait = max(int(retry_after or 0), 60 * 2**attempt)
                 if attempt == 4 or wait > 120:
-                    raise GitHubError(f"GitHub returned HTTP {error.code}; checkpoint can resume after the rate limit resets") from None
+                    raise GitHubError(f"GitHub returned HTTP {error.code}; the run can resume from its checkpoint") from None
                 time.sleep(wait)
+            except (URLError, TimeoutError) as error:
+                # A dropped connection or a read timeout behaves like a 5xx here.
+                if attempt == 4:
+                    raise GitHubError(f"GitHub request failed ({type(error).__name__}); the run can resume from its checkpoint") from None
+                time.sleep(2**attempt)
 
     def repositories(self, repos, fields):
         aliases = []
