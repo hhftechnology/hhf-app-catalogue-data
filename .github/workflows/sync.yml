@@ -1,0 +1,49 @@
+name: Publish catalogue snapshot
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      reference:
+        description: Optional baseline app reference for an AI evidence recheck
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalogue-publisher
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: ${{ github.repository == 'hhftechnology/hhf-app-catalogue-data' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: r2-publish
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: 'python -m pip install --only-binary=:all: --require-hashes -r requirements.txt'
+      - run: python -m unittest discover -s tests
+      - name: Refresh and publish
+        env:
+          PUBLISH_REFERENCE: ${{ inputs.reference || '' }}
+          HHF_APPS_GITHUB_TOKEN: ${{ secrets.HHF_APPS_GITHUB_TOKEN }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        shell: bash
+        run: |
+          if [[ -n "$PUBLISH_REFERENCE" ]]; then
+            python publisher.py --reference="$PUBLISH_REFERENCE"
+          else
+            python publisher.py
+          fi
