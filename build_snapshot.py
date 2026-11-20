@@ -13,7 +13,7 @@ FILENAMES = {
     "history": "history.json",
 }
 APP_FIELDS = (
-    "id", "reference", "name", "description", "website", "repository", "source",
+    "id", "reference", "source_reference", "name", "description", "website", "repository", "source",
     "license", "language", "sso", "platform", "tags", "alternatives", "created",
     "icon_source", "icon_override", "icon_modifier",
 )
@@ -117,6 +117,10 @@ def normalize_baseline(baseline, minimum=500):
         for field, value in app.items():
             if isinstance(value, str) and not value.strip():
                 app[field] = None
+        require(
+            app["source_reference"] is None or REFERENCE.fullmatch(app["source_reference"]),
+            "invalid source reference",
+        )
         require(app["sso"] in (None, "no", "yes", "enterprise", "plugin"), "invalid sso")
         require(app["created"] is None or iso_date(app["created"]), "invalid app creation date")
         if row.get("icon_key") is not None:
@@ -167,14 +171,34 @@ def build(apps, dictionaries, metrics, ai_signals, history, observations, today)
     }
 
 
-def validate(files, count):
+def validate(files, count, allow_legacy_app_fields=False):
+    """Validate one complete snapshot.
+
+    `allow_legacy_app_fields` exists for reading a snapshot that is already in
+    the bucket. Snapshots written before `source_reference` joined `APP_FIELDS`
+    carry the previous key set, and rejecting them would block the next publish
+    (or an operator rollback) before anything is written. Candidates built by
+    this revision are always validated strictly, so the field cannot go missing
+    from a new snapshot; the legacy set is only tolerated when reading.
+    """
     require(set(files) == set(FILENAMES), "snapshot roles mismatch")
     apps = files["apps"]["entries"]
     refs = {row["reference"]: row["id"] for row in apps}
     require(count > 0 and len(apps) == len(refs) == count, "snapshot count mismatch")
     require(len(set(refs.values())) == count, "duplicate snapshot id")
     app_fields = set(APP_FIELDS)
-    require(all(set(row).difference({"icon_key"}) == app_fields and REFERENCE.fullmatch(row["reference"]) and integer(row["id"], 1) and row["name"].strip() for row in apps), "invalid snapshot app")
+    legacy_fields = app_fields - {"source_reference"}
+    require(
+        all(
+            (set(row).difference({"icon_key"}) == app_fields
+             or (allow_legacy_app_fields and set(row).difference({"icon_key"}) == legacy_fields))
+            and REFERENCE.fullmatch(row["reference"])
+            and integer(row["id"], 1)
+            and row["name"].strip()
+            for row in apps
+        ),
+        "invalid snapshot app",
+    )
     for row in apps:
         validate_approved_metadata(row)
     metrics = files["metrics"]["apps"]

@@ -100,5 +100,5 @@ def read_previous(store):
         body, _ = store.get(key)
         require(body is not None and digest(body) == entry["sha256"], "live snapshot file is missing or corrupt")
         files[role] = decode(body)
-    validate(files, manifest["count"])
+    validate(files, manifest["count"], allow_legacy_app_fields=True)
     return manifest, files, etag

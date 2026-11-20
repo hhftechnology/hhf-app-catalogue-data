@@ -3,7 +3,7 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
-from build_snapshot import InvalidSnapshot, decode, encode, package
+from build_snapshot import FILENAMES, InvalidSnapshot, decode, encode, normalize_baseline, package, validate
 from github_client import GitHub, GitHubError, development_signals
 from publisher import run
 from tests.fixture_source import BASELINE_INPUT, BUILD_TIME, ExampleGitHub, MemoryStore
@@ -151,6 +151,30 @@ class PublisherTest(unittest.TestCase):
             self.publish()
         self.assertEqual(self.store.writes, [])
         self.assertEqual(self.api.metric_calls, [])
+
+    def test_stored_snapshot_without_source_reference_still_validates(self):
+        root = Path(__file__).parent / "fixtures" / "v1" / "snapshot" / "2026.11.15.1"
+        files = {role: decode((root / filename).read_bytes()) for role, filename in FILENAMES.items()}
+        validate(files, 2)
+        legacy = copy.deepcopy(files)
+        for row in legacy["apps"]["entries"]:
+            row.pop("source_reference")
+        with self.assertRaises(InvalidSnapshot):
+            validate(legacy, 2)
+        validate(legacy, 2, allow_legacy_app_fields=True)
+        legacy["apps"]["entries"][0]["unexpected"] = "x"
+        with self.assertRaises(InvalidSnapshot):
+            validate(legacy, 2, allow_legacy_app_fields=True)
+
+    def test_blank_source_reference_normalizes_to_null(self):
+        baseline = copy.deepcopy(BASELINE_INPUT)
+        baseline["apps"]["entries"][0]["source_reference"] = ""
+        baseline["apps"]["entries"][1]["source_reference"] = "   "
+        apps, _, _ = normalize_baseline(baseline, minimum=2)
+        self.assertEqual([app["source_reference"] for app in apps], [None, None])
+        baseline["apps"]["entries"][0]["source_reference"] = "not a reference"
+        with self.assertRaises(InvalidSnapshot):
+            normalize_baseline(baseline, minimum=2)
 
     def test_bad_schema_cannot_be_packaged(self):
         self.publish()
