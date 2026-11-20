@@ -13,7 +13,7 @@ FILENAMES = {
     "history": "history.json",
 }
 APP_FIELDS = (
-    "id", "reference", "name", "description", "website", "repository", "source",
+    "id", "reference", "source_reference", "name", "description", "website", "repository", "source",
     "license", "language", "sso", "platform", "tags", "alternatives", "created",
     "icon_source", "icon_override", "icon_modifier",
 )
@@ -103,6 +103,11 @@ def normalize_baseline(baseline, minimum=500):
         require(integer(row.get("id"), 1), "invalid app id")
         ref = row.get("reference")
         require(isinstance(ref, str) and REFERENCE.fullmatch(ref), "invalid app reference")
+        source_ref = row.get("source_reference")
+        require(
+            source_ref is None or (isinstance(source_ref, str) and REFERENCE.fullmatch(source_ref)),
+            "invalid source reference",
+        )
         name = row.get("name")
         require(isinstance(name, str) and name.strip() and len(name) <= 120, "invalid app name")
         app = {key: row.get(key) for key in APP_FIELDS}
