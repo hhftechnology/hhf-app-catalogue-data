@@ -7,8 +7,8 @@ from datetime import timedelta
 from pathlib import Path
 
 from build_snapshot import FILENAMES, InvalidSnapshot, decode, encode, normalize_baseline, package, validate
-from github_client import GitHub, GitHubError, development_signals
-from publisher import run
+from github_client import GitHub, GitHubError, GitHubTransient, development_signals
+from publisher import refresh_ai, run
 from tests.fixture_source import BASELINE_INPUT, BUILD_TIME, ExampleGitHub, MemoryStore
 from upload_r2 import BASELINE, POINTER, StoreError, read_previous
 
@@ -46,6 +46,36 @@ class _FlakyOpener:
                 raise failure
             raise HTTPError(request.full_url, failure, "upstream", {}, None)
         return _Response(self.payload)
+
+
+class _AiApi:
+    """AI phase stand-in that refuses any batch containing a listed repository."""
+
+    def __init__(self, failing=(), ai_failing=()):
+        self.failing = set(failing)
+        self.ai_failing = set(ai_failing)
+        self.calls = []
+
+    def ai_configs(self, names):
+        self.calls.append(tuple(names))
+        if self.failing.intersection(names):
+            raise GitHubTransient("GitHub returned HTTP 502; the run can resume from its checkpoint")
+        return {name: {"p0": None, "readme": {}, "repositoryTopics": {"nodes": []}} for name in names}
+
+    def ai(self, name, config, has_commits):
+        if name in self.ai_failing:
+            raise GitHubTransient("GitHub returned HTTP 502; the run can resume from its checkpoint")
+        return []
+
+
+class _HeavyBatchGitHub(ExampleGitHub):
+    """Refuses any AI config batch with more than one repository, as GitHub does
+    when a batch carries too much README text."""
+
+    def ai_configs(self, names):
+        if len(names) > 1:
+            raise GitHubTransient("GitHub returned HTTP 502; the run can resume from its checkpoint")
+        return {name: {} for name in names}
 
 
 class PublisherTest(unittest.TestCase):
@@ -265,6 +295,70 @@ class GitHubTest(unittest.TestCase):
         self.assertIn("RemoteDisconnected", str(caught.exception))
         self.assertIn("resume from its checkpoint", str(caught.exception))
         self.assertEqual(client.opener.calls, 5)
+
+    def test_ai_configs_halves_a_batch_github_refuses(self):
+        client = GitHub("token")
+        sizes = []
+
+        def repositories(repos, _fields):
+            sizes.append(len(repos))
+            if len(repos) > 1:
+                raise GitHubTransient("GitHub returned HTTP 502; the run can resume from its checkpoint")
+            return {repos[0]: {"p0": None, "readme": None, "repositoryTopics": {"nodes": []}}}
+
+        client.repositories = repositories
+        result = client.ai_configs(("a/one", "b/two", "c/three"))
+        self.assertEqual(sorted(result), ["a/one", "b/two", "c/three"])
+        self.assertEqual(sizes, [3, 1, 2, 1, 1])
+
+    def test_ai_configs_reraises_when_one_repository_keeps_failing(self):
+        client = GitHub("token")
+        sizes = []
+
+        def repositories(repos, _fields):
+            sizes.append(len(repos))
+            raise GitHubTransient("GitHub returned HTTP 502; the run can resume from its checkpoint")
+
+        client.repositories = repositories
+        with self.assertRaises(GitHubTransient):
+            client.ai_configs(("a/one",))
+        self.assertEqual(sizes, [1])
+
+    def test_scheduled_run_skips_a_failing_ai_batch_and_still_records_the_rest(self):
+        api = _AiApi(failing=("a/one",))
+        app_repos = {
+            "app-a": {"nameWithOwner": "a/one", "defaultBranchRef": None},
+            "app-b": {"nameWithOwner": "b/two", "defaultBranchRef": None},
+        }
+        signals = {}
+        refresh_ai(api, {"ai": {}}, ["app-a", "app-b"], signals, app_repos, BUILD_TIME, lambda: None, None)
+        # The refused batch is retried per repository, so only the bad one is lost.
+        self.assertEqual(sorted(signals), ["app-b"])
+        self.assertEqual([len(call) for call in api.calls], [2, 1, 1])
+
+    def test_targeted_recheck_reports_a_failing_ai_batch(self):
+        api = _AiApi(failing=("a/one",))
+        app_repos = {"app-a": {"nameWithOwner": "a/one", "defaultBranchRef": None}}
+        with self.assertRaises(GitHubTransient):
+            refresh_ai(api, {"ai": {}}, ["app-a"], {}, app_repos, BUILD_TIME, lambda: None, "app-a")
+
+    def test_publish_completes_when_a_github_batch_is_refused(self):
+        baseline = copy.deepcopy(BASELINE_INPUT)
+        baseline["apps"]["entries"][1]["repository"] = "https://github.com/example/sample-other"
+        api = _HeavyBatchGitHub()
+        result = run(MemoryStore(baseline), api, None, now=BUILD_TIME, minimum=2)
+        self.assertTrue(result.startswith("published"), result)
+        self.assertEqual(len(api.ai_calls), 2)
+
+    def test_scheduled_run_skips_one_repository_whose_history_fails(self):
+        api = _AiApi(failing=(), ai_failing=("b/two",))
+        app_repos = {
+            "app-a": {"nameWithOwner": "a/one", "defaultBranchRef": None},
+            "app-b": {"nameWithOwner": "b/two", "defaultBranchRef": None},
+        }
+        signals = {}
+        refresh_ai(api, {"ai": {}}, ["app-a", "app-b"], signals, app_repos, BUILD_TIME, lambda: None, None)
+        self.assertEqual(sorted(signals), ["app-a"])
 
     def test_graphql_accepts_only_alias_level_not_found_and_public_repos(self):
         api = GitHub("unused")

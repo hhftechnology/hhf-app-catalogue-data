@@ -24,6 +24,10 @@ class GitHubError(RuntimeError):
     pass
 
 
+class GitHubTransient(GitHubError):
+    """Upstream 5xx or a dropped connection: the request may succeed if repeated."""
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -109,7 +113,11 @@ class GitHub:
                         raise GitHubError(f"GitHub exhausted its quota; resume after {reset}") from None
                     wait = max(int(retry_after or 0), 60 * 2**attempt)
                 if attempt == 4 or wait > 120:
-                    raise GitHubError(f"GitHub returned HTTP {error.code}; the run can resume from its checkpoint") from None
+                    if transient:
+                        raise GitHubTransient(
+                            f"GitHub returned HTTP {error.code}; the run can resume from its checkpoint"
+                        ) from None
+                    raise GitHubError(f"GitHub returned HTTP {error.code}; checkpoint can resume after the rate limit resets") from None
                 time.sleep(wait)
             except (URLError, TimeoutError, ConnectionError) as error:
                 # A dropped connection or a read timeout behaves like a 5xx here.
@@ -117,7 +125,9 @@ class GitHub:
                 # ConnectionResetError), which urllib does not wrap in URLError
                 # because it is raised from getresponse() after the request.
                 if attempt == 4:
-                    raise GitHubError(f"GitHub request failed ({type(error).__name__}); the run can resume from its checkpoint") from None
+                    raise GitHubTransient(
+                        f"GitHub request failed ({type(error).__name__}); the run can resume from its checkpoint"
+                    ) from None
                 time.sleep(2**attempt)
 
     def repositories(self, repos, fields):
@@ -154,7 +164,30 @@ class GitHub:
 
     def ai_configs(self, repos):
         paths = " ".join(f"p{i}:object(expression:{json.dumps('HEAD:' + path)}){{__typename}}" for i, path in enumerate(CONFIG))
-        return self.repositories(repos, paths + " readme:object(expression:\"HEAD:README.md\"){... on Blob{text isTruncated}} repositoryTopics(first:30){nodes{topic{name}}}")
+        fields = paths + " readme:object(expression:\"HEAD:README.md\"){... on Blob{text isTruncated}} repositoryTopics(first:30){nodes{topic{name}}}"
+        return self._configs(tuple(repos), fields)
+
+    def _configs(self, repos, fields):
+        """Fetch configs for `repos`, halving the batch whenever the API refuses it.
+
+        A batch carries up to 50 repositories and pulls a README body for each, so
+        one heavy repository can make GitHub answer 502 for the whole query. Every
+        scheduled run then dies at the same batch and nothing is ever published.
+        Splitting isolates the weight: smaller batches succeed, and a repository
+        that fails on its own still raises so the caller can decide.
+        """
+        if not repos:
+            return {}
+        try:
+            return self.repositories(repos, fields)
+        except GitHubTransient:
+            if len(repos) == 1:
+                raise
+            middle = len(repos) // 2
+            return {
+                **self._configs(repos[:middle], fields),
+                **self._configs(repos[middle:], fields),
+            }
 
     def ai(self, repo, config, has_commits):
         commits = []

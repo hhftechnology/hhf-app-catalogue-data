@@ -9,7 +9,7 @@ from build_snapshot import (
     METRIC_FIELDS, REFERENCE, InvalidSnapshot, build, decode, digest, encode, normalize_baseline,
     package, require,
 )
-from github_client import GitHub, GitHubError, repository_name
+from github_client import GitHub, GitHubError, GitHubTransient, repository_name
 from upload_r2 import BASELINE, POINTER, R2, StoreError, read_previous
 
 
@@ -34,14 +34,38 @@ def refresh_metrics(api, app_rows, progress, save, now):
 def refresh_ai(api, progress, candidates, ai_signals, app_repos, now, save, target):
     for group in batched(candidates, 50):
         canonical = {ref: app_repos[ref]["nameWithOwner"] for ref in group}
-        configs = api.ai_configs(tuple(dict.fromkeys(canonical.values())))
+        names = tuple(dict.fromkeys(canonical.values()))
+        try:
+            configs = api.ai_configs(names)
+        except GitHubTransient as error:
+            # A scheduled run must still publish, and the contract allows an app to
+            # have no AI row. One heavy repository must not cost the rest of the
+            # batch its check, so retry the batch one repository at a time. A
+            # targeted recheck reports the failure instead of degrading.
+            if target:
+                raise
+            configs = {}
+            for name in names:
+                try:
+                    configs.update(api.ai_configs((name,)))
+                except GitHubTransient:
+                    print(f"AI check skipped for {name}: {error}", file=sys.stderr)
         for ref in group:
             repo = canonical[ref]
-            config = configs[repo]
+            # Absent when the repository is unavailable, and also when its batch
+            # could not be fetched; both leave the app unchecked.
+            config = configs.get(repo)
             if config is None:
                 require(ref != target, "targeted GitHub repository is unavailable")
                 continue
-            evidence = api.ai(repo, config, app_repos[ref]["defaultBranchRef"] is not None)
+            try:
+                evidence = api.ai(repo, config, app_repos[ref]["defaultBranchRef"] is not None)
+            except GitHubTransient as error:
+                # The commit history for one repository must not abort the snapshot.
+                if target:
+                    raise
+                print(f"AI check skipped for {repo}: {error}", file=sys.stderr)
+                continue
             confidence = min(1.0, round(sum(item["weight"] for item in evidence), 1))
             row = {"reference": ref, "confidence": confidence, "assisted": confidence >= 0.5,
                    "evidence": evidence, "checked_at": utc_stamp(now)}
