@@ -111,8 +111,11 @@ class GitHub:
                 if attempt == 4 or wait > 120:
                     raise GitHubError(f"GitHub returned HTTP {error.code}; the run can resume from its checkpoint") from None
                 time.sleep(wait)
-            except (URLError, TimeoutError) as error:
+            except (URLError, TimeoutError, ConnectionError) as error:
                 # A dropped connection or a read timeout behaves like a 5xx here.
+                # ConnectionError covers http.client.RemoteDisconnected (a
+                # ConnectionResetError), which urllib does not wrap in URLError
+                # because it is raised from getresponse() after the request.
                 if attempt == 4:
                     raise GitHubError(f"GitHub request failed ({type(error).__name__}); the run can resume from its checkpoint") from None
                 time.sleep(2**attempt)

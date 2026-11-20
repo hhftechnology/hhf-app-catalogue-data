@@ -1,5 +1,6 @@
 import copy
 import unittest
+from http.client import RemoteDisconnected
 from unittest import mock
 from urllib.error import HTTPError
 from datetime import timedelta
@@ -40,7 +41,10 @@ class _FlakyOpener:
     def open(self, request, timeout=None):
         self.calls += 1
         if self.failures:
-            raise HTTPError(request.full_url, self.failures.pop(0), "upstream", {}, None)
+            failure = self.failures.pop(0)
+            if isinstance(failure, BaseException):
+                raise failure
+            raise HTTPError(request.full_url, failure, "upstream", {}, None)
         return _Response(self.payload)
 
 
@@ -241,6 +245,24 @@ class GitHubTest(unittest.TestCase):
         with mock.patch("github_client.time.sleep"):
             with self.assertRaises(GitHubError) as caught:
                 client.request("/rate_limit")
+        self.assertIn("resume from its checkpoint", str(caught.exception))
+        self.assertEqual(client.opener.calls, 5)
+
+    def test_remote_disconnected_is_retried(self):
+        client = GitHub("token")
+        client.opener = _FlakyOpener([RemoteDisconnected("remote end closed connection")])
+        with mock.patch("github_client.time.sleep") as sleep:
+            self.assertEqual(client.request("/rate_limit"), {})
+        self.assertEqual(client.opener.calls, 2)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1])
+
+    def test_persistent_remote_disconnected_fails_after_five_attempts(self):
+        client = GitHub("token")
+        client.opener = _FlakyOpener([RemoteDisconnected("remote end closed connection")] * 5)
+        with mock.patch("github_client.time.sleep"):
+            with self.assertRaises(GitHubError) as caught:
+                client.request("/rate_limit")
+        self.assertIn("RemoteDisconnected", str(caught.exception))
         self.assertIn("resume from its checkpoint", str(caught.exception))
         self.assertEqual(client.opener.calls, 5)
 
