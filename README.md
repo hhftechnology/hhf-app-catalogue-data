@@ -8,7 +8,7 @@ Upload a reviewed UTF-8 JSON object to `v1/input/baseline.json` in the target bu
 
 | Field | Input |
 | --- | --- |
-| `apps.entries` | Array of named app records. Each app has a positive integer `id`, unique `reference` with 2–64 ASCII letters, digits or hyphens, and a `name`. Include approved metadata such as `repository`, `website`, `description`, `source`, `license`, `language`, `sso`, `platform`, `tags`, `alternatives`, `created`, and icon hints when available. `tags` and `alternatives` use integer IDs. |
+| `apps.entries` | Array of named app records. Each app has a positive integer `id`, unique `reference` with 2–64 ASCII letters, digits or hyphens, and a `name`. Include approved metadata such as `repository`, `website`, `description`, `source`, `source_reference`, `license`, `language`, `sso`, `platform`, `tags`, `alternatives`, `created`, and icon hints when available. `source_reference` keeps the catalogue identity separate from the publisher's own `reference` and follows the same 2–64 character rule; blank values become `null`. `tags` and `alternatives` use integer IDs. |
 | `metrics.apps` | Array of approved initial metrics keyed by positive integer `id`. The publisher accepts `stars`, `forks`, `commit` (`YYYY-MM-DD`), `trending`, and `archived` as initial values. |
 | `tags`, `alternatives` | Arrays of named `{"id": 1, "label": "Example"}` rows. Tags must also produce distinct ASCII slugs. References to missing labels stay unresolved. |
 | `approved_additions` | Optional private review object written by the publisher when more than 25 new entries need review. |
@@ -20,6 +20,8 @@ Include descriptions of up to 300 characters only after provenance review. For a
 ## Snapshot contract
 
 `v1/manifest.json` contains `schema_version: 1`, `version` (`YYYY.MM.DD.N`), `built` (UTC ISO 8601), `count`, and `files`. Each role points to `{"key": "v1/snapshot/<version>/<filename>", "sha256": "<lowercase digest>"}`. Digests are computed over the exact UTF-8 response bytes. All objects have `Content-Type: application/json` and `Cache-Control: private, no-store`.
+
+Every `apps.json` row carries `source_reference` (`null` when the baseline does not supply one). A snapshot already in the bucket that was written before this field existed is still accepted when it is read, so an older live pointer or an operator rollback cannot block the next publish; newly built candidates are validated strictly and must carry the field. Retaining the field in the snapshot is what lets the catalogue consumer keep its own identity for an app after the publisher renames a `reference`.
 
 | Role | File | JSON shape |
 | --- | --- | --- |
